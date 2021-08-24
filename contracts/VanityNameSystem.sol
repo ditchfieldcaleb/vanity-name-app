@@ -1,5 +1,3 @@
-
-
 /** Vanity Name (Registration) System, or VNS. Definitely not a play on ENS.
 
 Goals:
@@ -66,6 +64,7 @@ contract VNS {
         uint pendingRegCompletionTime;
 
         uint totalAmountLocked;
+        uint freeAmount;
         bytes32[] ownedNames;
     }
     
@@ -82,11 +81,15 @@ contract VNS {
         revert("You cannot directly send ETH to VNS");
     }
 
+    /// @notice beings a registration. bytes32 nameHash can be any bytes32 sequence
     function beginRegistration(bytes32 nameHash) public {
         userInfo[msg.sender].pendingRegHash = nameHash;
         userInfo[msg.sender].pendingRegCompletionTime = block.timestamp + requiredRegistrationDelay;
     }
 
+    /// @notice complete a registration. delay period must have passed, and provided name/salt must match the earlier provided hash.
+    /// @dev this requires the user to have some kind of in-browser storage, eg cookies, in case they navigate away from the page after submitting the
+    ///      first registration transaction but not the second.
     function completeRegistration(bytes32 name, bytes32 salt) public payable {
         require(userInfo[msg.sender].pendingRegHash != 0x0, "No pending registration.");
         require(userInfo[msg.sender].pendingRegCompletionTime > block.timestamp, "Delay period not yet complete.");
@@ -110,6 +113,7 @@ contract VNS {
         userInfo[msg.sender].ownedNames.push(name);
     }
 
+    /// @notice renew a registration; must be within the renewal period and you must own the name
     function renewRegistration(bytes32 name) public {
         require(vanityRegistrationsByName[name].owner == msg.sender, "You do not own this name.");
         require(block.timestamp >= vanityRegistrationsByName[name].expiration - renewalPeriod, "Name not yet eligibile for rewnewal.");
@@ -117,16 +121,21 @@ contract VNS {
         vanityRegistrationsByName[name].expiration += renewalPeriod;
     }
 
+    /// @notice anyone can unregister an expired name; only the owner can unregister a non-expired name.
+    /// @dev instead of directly transferring their balance, we instead just increase the freeAmount to prevent DOS via smart contract
     function unRegisterName(bytes32 name) public {
         require(vanityRegistrationsByName[name].owner == msg.sender || vanityRegistrationsByName[name].expiration <= block.timestamp, "Name must be expired or you must own this name.");
 
         uint amountToTransfer = vanityRegistrationsByName[name].amountLocked;
 
-        delete vanityRegistrationsByName[name];
+        userInfo[vanityRegistrationsByName[name].owner].totalAmountLocked -= amountToTransfer;
+        userInfo[vanityRegistrationsByName[name].owner].freeAmount += amountToTransfer;
 
-        payable(msg.sender).transfer(amountToTransfer);
+        delete vanityRegistrationsByName[name];
     }
 
+    /// @notice a helpful function to lookup a VNS name and call a function on the associated address.
+    /// @dev could be useful for smart contracts that register their own names.
     function lookupAndExecute(bytes32 name, uint value, bytes calldata data) public payable {
         require(vanityRegistrationsByName[name].owner != address(0x0), "Name not registered.");
         require(vanityRegistrationsByName[name].expiration > block.timestamp, "Name has expired.");
@@ -137,6 +146,9 @@ contract VNS {
         destination.call{value: value}(data);
     }
 
+    /// @notice returns the amount of ether needed to lock a given name
+    /// @dev internally, gets the name-length and uses this to calculate the lock amount
+    /// @return the amount needed to lock this name
     function getLockAmount(bytes32 name) public pure returns (uint) {
         uint length = getNameLength(name);
         
@@ -145,9 +157,10 @@ contract VNS {
         return maxFee / (length - minNameLength + 1);
     }
 
-    /** 1 byte per character. 0x00 byte is a terminator. **/
+    /// @dev Returns the length of the name. 0x00 byte is a terminator.
+    /// @return the length of the name, up to 32 characters.
     function getNameLength(bytes32 name) public pure returns (uint) {
-        
+
         // 1 byte per character, maximum 32 characters
         for (uint i = 0; i < 32; i++) {
             if (name[i] == 0x0) {
@@ -157,7 +170,9 @@ contract VNS {
         
         return 32;
     }
-
+    
+    /// @param name - bytes32 representation of the name in ascii encoding
+    /// @return true if the name is valid, false otherwise. only valid chars are a-z lowercase.
     function isValidName(bytes32 name) public pure returns (bool) {
         uint8 minAllowedAsciiCode = 0x61; // a
         uint8 maxAllowedAsciiCode = 0x7A; // z
