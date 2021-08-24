@@ -7,7 +7,7 @@ Goals:
  - resistant to frontrunning
  - smaller size name = larger price
  + implement reverse-lookup
- + implement pass-through function execution (more on this later)'
+ + implement pass-through function execution (more on this later)
  + an address should be able to have mulitple vanities
  + a vanity should map to a single address
 
@@ -100,6 +100,17 @@ contract VNS {
         if (costOfVanity > msg.value) {
             payable(msg.sender).transfer(msg.value - costOfVanity);
         }
+    }
+
+    function lookupAndExecute(bytes32 name, uint value, bytes calldata data) public payable {
+        require(vanityToExpirationDatetime[name] > block.timestamp, "Name has expired.");
+        require(msg.value == value, "Must send exactly the value supplied.");
+
+        address destination = vanityToAddress[name];
+
+        require(destination != address(0x0), "Name not registered.");
+
+        destination.call{value: value}(data);
     }
 
     function getNameLength(bytes32 name) public view returns (uint) {
