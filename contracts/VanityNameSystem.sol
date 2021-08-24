@@ -17,7 +17,7 @@ Implementation:
  - reveal: provide name, salt, show that hash is valid
  - delay between commit & reveal must be high enough to make frontrunning/censoring infeasible
  - minimum size: 3 characters. 2 or 1 character size names would be too easy to squat
- - fee = 0.01 ETH minimum, 1 ETH maximum. 10 chars or more = 0.01 ETH, 3 chars = 1 ETH
+ - fee = 0.01 ETH minimum, 1 ETH maximum
  - if a vanity has owner 0x0, it is not registered.
 
 Caveats:
@@ -32,8 +32,8 @@ Caveats:
 Notes & Attribution:
  - Helpful Notes on Commit/Reveal Scheme: https://medium.com/gitcoin/commit-reveal-scheme-on-ethereum-25d1d1a25428
  - Salt is necessary to prevent brute-force-name-guessing attacks
- - Maximum size is 51 characters. Why? We can encode a-z with only 5 bits, so using a whole uint256/bytes32 storage slot we can get up to 51 characters
- - Of course, this only works with the standard English alphabet! Other languages not supported.
+ - Maximum size is 32 characters, because this fits in a single storage slot
+ - Only a-z supported - ascii codes 0x61-0x7A
 
 **/
 
@@ -44,25 +44,33 @@ pragma solidity 0.8.7;
 contract VNS {
     // todo: events
 
-    uint constant public registrationPeriod = 60 minutes * 24 /*hours*/ * 365 /*days*/;
-    uint constant public requiredDelay = 5 minutes;
+    uint constant public registrationPeriod = 365 days;
+    uint constant public requiredRegistrationDelay = 5 minutes;
+    uint constant public renewalPeriod = 1 weeks;
 
     uint constant public minNameLength = 3;
-    uint constant public maxNameLength = 51;
-    uint constant public minFeeLength = 10;
+    uint constant public maxNameLength = 32;
 
     uint constant public minFee = 0.01 ether;
     uint constant public maxFee = 1 ether;
 
-    mapping(address => bytes32) public inProgressRegHashes;
-    mapping(address => uint) public inProgressRegCompletionTimes;
+    struct VanityRegistration {
+        bytes32 name;
+        address owner;
+        uint expiration;    /* unix timestamp                    */
+        uint amountLocked;  /* ether locked by this name         */
+    }
 
-    mapping(address => uint) public addressToLockedBalance;
+    struct UserInfo {
+        bytes32 pendingRegHash;
+        uint pendingRegCompletionTime;
 
-    mapping(bytes32 => address) private vanityToAddress;
-    mapping(bytes32 => uint) public vanityToExpirationDatetime;
-
-    mapping(address => bytes32[]) private addressToVanities;
+        uint totalAmountLocked;
+        bytes32[] ownedNames;
+    }
+    
+    mapping(address => UserInfo) userInfo;
+    mapping(bytes32 => VanityRegistration) vanityRegistrationsByName;
 
     constructor() { }
 
@@ -74,75 +82,92 @@ contract VNS {
         revert("You cannot directly send ETH to VNS");
     }
 
-    function beginRegistration(bytes32 hash) public{
-        inProgressRegHashes[msg.sender] = hash;
-        inProgressRegCompletionTimes[msg.sender] = block.timestamp + requiredDelay;
+    function beginRegistration(bytes32 nameHash) public {
+        userInfo[msg.sender].pendingRegHash = nameHash;
+        userInfo[msg.sender].pendingRegCompletionTime = block.timestamp + requiredRegistrationDelay;
     }
 
     function completeRegistration(bytes32 name, bytes32 salt) public payable {
-        require(inProgressRegHashes[msg.sender] != bytes32(0x0), "No pending registration to complete!");
-        require(inProgressRegCompletionTimes[msg.sender] <= block.timestamp, "Too early to complete registration.");
-        require(inProgressRegHashes[msg.sender] == keccak256(abi.encodePacked(msg.sender, name, salt)), "Name and salt do not match existing hash.");
+        require(userInfo[msg.sender].pendingRegHash != 0x0, "No pending registration.");
+        require(userInfo[msg.sender].pendingRegCompletionTime > block.timestamp, "Delay period not yet complete.");
+        require(msg.value == getLockAmount(name), "Invalid fee amount.");
+        require(keccak256(abi.encodePacked(msg.sender, name, salt)) == userInfo[msg.sender].pendingRegHash, "Invalid input. Please check the salt.");
+        require(isValidName(name), "Invalid name, can only contain a-z lowercase");        
 
-        uint costOfVanity = lengthToPrice(getNameLength(name));
-        require(msg.value >= costOfVanity, "Must pay at least the cost of the name.");
-
-        addressToLockedBalance[msg.sender] += costOfVanity;
-
-        inProgressRegHashes[msg.sender] = 0x0;
-        inProgressRegCompletionTimes[msg.sender] = 0x0;
-
-        vanityToAddress[name] = msg.sender;
-        vanityToExpirationDatetime[name] = block.timestamp + registrationPeriod;
-
-        addressToVanities[msg.sender].push(name);
-
-        if (costOfVanity > msg.value) {
-            payable(msg.sender).transfer(msg.value - costOfVanity);
+        if(vanityRegistrationsByName[name].owner != address(0x0)) {
+            if (vanityRegistrationsByName[name].expiration < block.timestamp) {
+                revert("Name already registered.");
+            } else {
+                unRegisterName(name);
+            }
         }
+
+        // Name is definitely not registered at this point.
+        vanityRegistrationsByName[name] = VanityRegistration(name, msg.sender, block.timestamp + registrationPeriod, msg.value);
+        userInfo[msg.sender].totalAmountLocked += msg.value;
+        userInfo[msg.sender].pendingRegHash = 0x0;
+        userInfo[msg.sender].pendingRegCompletionTime = 0;
+        userInfo[msg.sender].ownedNames.push(name);
+    }
+
+    function renewRegistration(bytes32 name) public {
+        require(vanityRegistrationsByName[name].owner == msg.sender, "You do not own this name.");
+        require(block.timestamp >= vanityRegistrationsByName[name].expiration - renewalPeriod, "Name not yet eligibile for rewnewal.");
+
+        vanityRegistrationsByName[name].expiration += renewalPeriod;
+    }
+
+    function unRegisterName(bytes32 name) public {
+        require(vanityRegistrationsByName[name].owner == msg.sender || vanityRegistrationsByName[name].expiration <= block.timestamp, "Name must be expired or you must own this name.");
+
+        uint amountToTransfer = vanityRegistrationsByName[name].amountLocked;
+
+        delete vanityRegistrationsByName[name];
+
+        payable(msg.sender).transfer(amountToTransfer);
     }
 
     function lookupAndExecute(bytes32 name, uint value, bytes calldata data) public payable {
-        require(vanityToExpirationDatetime[name] > block.timestamp, "Name has expired.");
-        require(msg.value == value, "Must send exactly the value supplied.");
+        require(vanityRegistrationsByName[name].owner != address(0x0), "Name not registered.");
+        require(vanityRegistrationsByName[name].expiration > block.timestamp, "Name has expired.");
+        require(msg.value == value, "Must send exactly the value specified.");
 
-        address destination = vanityToAddress[name];
-
-        require(destination != address(0x0), "Name not registered.");
+        address destination = vanityRegistrationsByName[name].owner;
 
         destination.call{value: value}(data);
     }
 
-    function getAddressOfVanity(bytes32 name) public view returns (address) {
-        require(vanityToExpirationDatetime[name] > block.timestamp, "Name has expired.");
+    function getLockAmount(bytes32 name) public pure returns (uint) {
+        uint length = getNameLength(name);
+        
+        require(length >= minNameLength && length <= maxNameLength, "Name must be between 3 and 32 characters.");
 
-        return vanityToAddress[name];
+        return maxFee / (length - minNameLength + 1);
     }
 
-    function getVanitiesOfAddress(address user) public view returns (bytes32[] memory) {
-        bytes32[] memory userVanities = addressToVanities[user];
+    /** 1 byte per character. 0x00 byte is a terminator. **/
+    function getNameLength(bytes32 name) public pure returns (uint) {
+        
+        // 1 byte per character, maximum 32 characters
+        for (uint i = 0; i < 32; i++) {
+            if (name[i] == 0x0) {
+                return i;
+            }
+        }
+        
+        return 32;
+    }
 
-        uint numValidVanities;
-        for (uint i = 0; i < userVanities.length; i++) {
-            if(vanityToExpirationDatetime[userVanities[i]] < block.timestamp) {
-                numValidVanities++;
+    function isValidName(bytes32 name) public pure returns (bool) {
+        uint8 minAllowedAsciiCode = 0x61; // a
+        uint8 maxAllowedAsciiCode = 0x7A; // z
+    
+        for (uint i = 0; i < 32; i++) {
+            if ((uint8(name[i]) < minAllowedAsciiCode || uint8(name[i]) > maxAllowedAsciiCode) && name[i] != 0x00) {
+                return false;
             }
         }
 
-        // figure out dynamic array stuff later
-    }
-
-    function getNameLength(bytes32 name) public view returns (uint) {
-        // todo: implement custom 5-bits a-z encoding
-    }
-
-    function lengthToPrice(uint length) public pure returns (uint) {
-        if (length < minNameLength) {
-            revert("Name too short");
-        } else if (length < minFeeLength) {
-            return maxFee / (length - minNameLength + 1);
-        } else {
-            return minFee;
-        }
+        return true;
     }
 }
