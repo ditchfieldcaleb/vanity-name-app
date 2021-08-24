@@ -59,10 +59,10 @@ contract VNS {
 
     mapping(address => uint) public addressToLockedBalance;
 
-    mapping(bytes32 => address) public vanityToAddress;
+    mapping(bytes32 => address) private vanityToAddress;
     mapping(bytes32 => uint) public vanityToExpirationDatetime;
 
-    mapping(address => bytes32[]) public addressToVanities;
+    mapping(address => bytes32[]) private addressToVanities;
 
     constructor() { }
 
@@ -111,6 +111,25 @@ contract VNS {
         require(destination != address(0x0), "Name not registered.");
 
         destination.call{value: value}(data);
+    }
+
+    function getAddressOfVanity(bytes32 name) public view returns (address) {
+        require(vanityToExpirationDatetime[name] > block.timestamp, "Name has expired.");
+
+        return vanityToAddress[name];
+    }
+
+    function getVanitiesOfAddress(address user) public view returns (bytes32[] memory) {
+        bytes32[] memory userVanities = addressToVanities[user];
+
+        uint numValidVanities;
+        for (uint i = 0; i < userVanities.length; i++) {
+            if(vanityToExpirationDatetime[userVanities[i]] < block.timestamp) {
+                numValidVanities++;
+            }
+        }
+
+        // figure out dynamic array stuff later
     }
 
     function getNameLength(bytes32 name) public view returns (uint) {
